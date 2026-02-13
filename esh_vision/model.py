@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint as cp
 
 from esh_vision.layers import HybridVisionBlock, PatchEmbedding
