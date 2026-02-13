@@ -350,10 +350,10 @@ def parse_args() -> argparse.Namespace:
 
     # Model
     p.add_argument("--patch_size", type=int, default=16)
-    p.add_argument("--embed_dim", type=int, default=384)
-    p.add_argument("--depths", type=str, default="4,4,12,4",
+    p.add_argument("--embed_dim", type=int, default=192)
+    p.add_argument("--depths", type=str, default="2,2,6,2",
                     help="Comma-separated block depths per stage")
-    p.add_argument("--num_heads", type=str, default="6,6,12,12",
+    p.add_argument("--num_heads", type=str, default="3,3,6,6",
                     help="Comma-separated attention heads per stage")
     p.add_argument("--ssm_d_state", type=int, default=16)
     p.add_argument("--act_threshold", type=float, default=0.7)
