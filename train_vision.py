@@ -217,8 +217,12 @@ def train(args: argparse.Namespace):
 
     print(f"[ESH-Vision] Starting training for {args.epochs} epochs "
           f"({total_steps} steps)")
+    print(f"[ESH-Vision] Batch size: {args.batch_size} x {args.grad_accum_steps} accum "
+          f"= {args.batch_size * args.grad_accum_steps} effective")
     print(f"[ESH-Vision] λ_var = {args.lambda_var}, "
           f"λ_ponder target = {args.lambda_ponder}")
+
+    accum_steps = args.grad_accum_steps
 
     for epoch in range(args.epochs):
         model.train()
@@ -227,15 +231,18 @@ def train(args: argparse.Namespace):
         num_batches = 0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        optimizer.zero_grad(set_to_none=True)
+
         for batch_idx, (images, labels) in enumerate(pbar):
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
-            # LR schedule
-            lr_cur = cosine_lr(
-                optimizer, global_step, total_steps, args.lr,
-                warmup_steps=args.warmup_steps,
-            )
+            # LR schedule (update per optimizer step, not per micro-batch)
+            if batch_idx % accum_steps == 0:
+                lr_cur = cosine_lr(
+                    optimizer, global_step, total_steps // accum_steps, args.lr,
+                    warmup_steps=args.warmup_steps,
+                )
 
             # Ponder cost coefficient
             lambda_p = build_ponder_lambda(
@@ -244,8 +251,6 @@ def train(args: argparse.Namespace):
                 warmup_end=args.ponder_warmup_end,
                 target=args.lambda_ponder,
             )
-
-            optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda" and args.amp)):
                 out = model(images)
@@ -262,26 +267,29 @@ def train(args: argparse.Namespace):
                 # Ponder cost
                 pond_loss = lambda_p * ponder_cost
 
-                total_loss = ce_loss + var_loss + pond_loss
+                total_loss = (ce_loss + var_loss + pond_loss) / accum_steps
 
             scaler.scale(total_loss).backward()
 
-            # Gradient clipping
-            if args.max_grad_norm > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), args.max_grad_norm
-                )
+            # Optimizer step every accum_steps micro-batches
+            if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(train_loader):
+                # Gradient clipping
+                if args.max_grad_norm > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), args.max_grad_norm
+                    )
 
-            scaler.step(optimizer)
-            scaler.update()
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
 
             # Metrics
             acc = (logits.argmax(-1) == labels).float().mean().item()
-            epoch_loss += total_loss.item()
+            epoch_loss += total_loss.item() * accum_steps
             epoch_acc += acc
             num_batches += 1
-            global_step += 1
 
             if batch_idx % args.log_every == 0:
                 mean_alpha = torch.cat(
@@ -350,10 +358,10 @@ def parse_args() -> argparse.Namespace:
 
     # Model
     p.add_argument("--patch_size", type=int, default=16)
-    p.add_argument("--embed_dim", type=int, default=192)
-    p.add_argument("--depths", type=str, default="2,2,6,2",
+    p.add_argument("--embed_dim", type=int, default=384)
+    p.add_argument("--depths", type=str, default="4,8,10",
                     help="Comma-separated block depths per stage")
-    p.add_argument("--num_heads", type=str, default="3,3,6,6",
+    p.add_argument("--num_heads", type=str, default="6,12,12",
                     help="Comma-separated attention heads per stage")
     p.add_argument("--ssm_d_state", type=int, default=16)
     p.add_argument("--act_threshold", type=float, default=0.7)
@@ -366,7 +374,9 @@ def parse_args() -> argparse.Namespace:
 
     # Training
     p.add_argument("--epochs", type=int, default=90)
-    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--grad_accum_steps", type=int, default=8,
+                    help="Gradient accumulation steps (effective batch = batch_size * this)")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=0.05)
     p.add_argument("--warmup_steps", type=int, default=1000)

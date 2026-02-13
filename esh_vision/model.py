@@ -28,8 +28,9 @@ from esh_vision.layers import HybridVisionBlock, PatchEmbedding
 class ESHVisionConfig:
     """All hyperparameters for an ESH-Vision backbone.
 
-    Defaults yield a *Small* variant (~25 M parameters) suitable for
-    12 GB VRAM training at batch-size 32 with gradient checkpointing.
+    Defaults yield a *Large* variant (~500 M parameters) suitable for
+    12 GB VRAM training at batch-size 4 with gradient accumulation
+    and gradient checkpointing.
     """
 
     # Input
@@ -37,11 +38,11 @@ class ESHVisionConfig:
     patch_size: int = 16
     in_chans: int = 3
 
-    # Architecture — hierarchical stages
-    embed_dim: int = 192
-    depths: List[int] = field(default_factory=lambda: [2, 2, 6, 2])
-    num_heads: List[int] = field(default_factory=lambda: [3, 3, 6, 6])
-    dim_scale: List[float] = field(default_factory=lambda: [1.0, 1.0, 1.0, 1.0])
+    # Architecture — 3-stage hierarchy (dims: 384 → 768 → 1536)
+    embed_dim: int = 384
+    depths: List[int] = field(default_factory=lambda: [4, 8, 10])
+    num_heads: List[int] = field(default_factory=lambda: [6, 12, 12])
+    dim_scale: List[float] = field(default_factory=lambda: [1.0, 1.0, 1.0])
 
     # SSM
     ssm_d_state: int = 16
