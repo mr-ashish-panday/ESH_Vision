@@ -272,6 +272,14 @@ def train(args: argparse.Namespace):
     model = ESHVisionBackbone(config).to(device)
     print(f"[ESH-Vision] Parameters: {model.get_num_params():,}")
 
+    # ---- torch.compile (PyTorch 2.x speedup) --------------------------------
+    if args.compile and hasattr(torch, "compile"):
+        print("[ESH-Vision] Compiling model with torch.compile ...")
+        model = torch.compile(model)
+        print("[ESH-Vision] Compilation done.")
+    elif args.compile:
+        print("[ESH-Vision] torch.compile not available (needs PyTorch >= 2.0)")
+
     # ---- Optimizer ---------------------------------------------------------
     if HAS_BNB and args.use_8bit:
         print("[ESH-Vision] Using bitsandbytes 8-bit AdamW")
@@ -470,7 +478,7 @@ def parse_args() -> argparse.Namespace:
                     action="store_false")
 
     # Training
-    p.add_argument("--epochs", type=int, default=90)
+    p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--grad_accum_steps", type=int, default=8,
                     help="Gradient accumulation steps (effective batch = batch_size * this)")
@@ -496,6 +504,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use_8bit", action="store_true", default=True,
                     help="Use bitsandbytes 8-bit AdamW")
     p.add_argument("--no_8bit", dest="use_8bit", action="store_false")
+    p.add_argument("--compile", action="store_true", default=False,
+                    help="Use torch.compile for 20-50%% speedup (PyTorch 2.x)")
 
     # Output
     p.add_argument("--output_dir", type=str, default="./checkpoints")
