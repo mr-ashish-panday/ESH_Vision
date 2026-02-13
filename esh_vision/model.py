@@ -85,13 +85,20 @@ class PatchMerging(nn.Module):
 
         Returns
         -------
-        out : (B, (H/2)*(W/2), 2*D)
+        out : (B, ceil(H/2)*ceil(W/2), 2*D)
         """
         B, N, D = x.shape
         H = W = self.grid_size
         assert N == H * W, f"Expected N={H*W}, got {N}"
 
         x = x.view(B, H, W, D)
+
+        # Pad to even dimensions if needed
+        pad_h = H % 2
+        pad_w = W % 2
+        if pad_h or pad_w:
+            x = F.pad(x.permute(0, 3, 1, 2), (0, pad_w, 0, pad_h)).permute(0, 2, 3, 1)
+            H, W = H + pad_h, W + pad_w
 
         # Gather 2×2 patches
         x0 = x[:, 0::2, 0::2, :]  # (B, H/2, W/2, D)
@@ -174,7 +181,7 @@ class ESHVisionBackbone(nn.Module):
                 ds = PatchMerging(cur_dim, cur_grid)
                 self.downsamples.append(ds)
                 cur_dim = cur_dim * 2
-                cur_grid = cur_grid // 2
+                cur_grid = (cur_grid + 1) // 2  # ceiling division (matches PatchMerging padding)
 
         self.final_dim = cur_dim
         self.norm = nn.LayerNorm(cur_dim)
@@ -246,14 +253,23 @@ class ESHVisionBackbone(nn.Module):
             # Downsample (except after last stage)
             if stage_idx < len(self.stages) - 1:
                 x = self.downsamples[stage_idx](x)
-                # Entropy also needs to be downsampled — average-pool 2×2
+                # Entropy must match new spatial size of x
+                new_n = x.shape[1]
                 B_ent = entropy.shape[0]
                 cur_grid = int(math.isqrt(entropy.shape[1]))
                 ent_2d = entropy.view(B_ent, cur_grid, cur_grid)
+                # Pad to even before pooling (matches PatchMerging)
+                pad_h = cur_grid % 2
+                pad_w = cur_grid % 2
+                if pad_h or pad_w:
+                    ent_2d = F.pad(ent_2d.unsqueeze(1), (0, pad_w, 0, pad_h)).squeeze(1)
+                else:
+                    ent_2d = ent_2d.unsqueeze(1).squeeze(1)
                 ent_2d = F.avg_pool2d(
                     ent_2d.unsqueeze(1).float(), kernel_size=2, stride=2
                 ).squeeze(1)
                 entropy = ent_2d.view(B_ent, -1)
+                assert entropy.shape[1] == new_n, f"Entropy {entropy.shape[1]} != x {new_n}"
 
         # Final norm + global average pool
         x = self.norm(x)                    # (B, N_last, D_final)
