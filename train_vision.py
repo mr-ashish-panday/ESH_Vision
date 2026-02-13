@@ -58,6 +58,13 @@ except ImportError:
     HAS_TV = False
 
 try:
+    from datasets import load_dataset as hf_load_dataset
+
+    HAS_HF = True
+except ImportError:
+    HAS_HF = False
+
+try:
     from tqdm import tqdm
 except ImportError:
     def tqdm(iterable, **kwargs):  # noqa: D103
@@ -83,6 +90,45 @@ class RandomImageDataset(Dataset):
     def __getitem__(self, idx: int):
         img = torch.rand(3, self.img_size, self.img_size)
         label = torch.randint(0, self.num_classes, (1,)).item()
+        return img, label
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace dataset wrapper
+# ---------------------------------------------------------------------------
+
+class HFImageDataset(Dataset):
+    """Wraps a HuggingFace image classification dataset as a PyTorch Dataset.
+
+    Works with datasets like interneuron/imagenet-100 that have
+    'image' (PIL) and 'label' (int) columns.
+    """
+
+    def __init__(self, hf_dataset, transform=None):
+        self.dataset = hf_dataset
+        self.transform = transform
+        # Build label mapping (some HF datasets use ClassLabel)
+        features = hf_dataset.features
+        if hasattr(features.get("label", None), "num_classes"):
+            self.num_classes = features["label"].num_classes
+        else:
+            self.num_classes = len(set(hf_dataset["label"]))
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int):
+        item = self.dataset[idx]
+        img = item["image"]
+        label = item["label"]
+
+        # Convert to RGB if needed (some images are grayscale/RGBA)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+
+        if self.transform is not None:
+            img = self.transform(img)
+
         return img, label
 
 
@@ -150,7 +196,44 @@ def train(args: argparse.Namespace):
             img_size=args.img_size,
             num_classes=num_classes,
         )
+    elif args.hf_dataset:
+        # ---- HuggingFace dataset (e.g. interneuron/imagenet-100) ----
+        if not HAS_HF:
+            sys.exit("Install `datasets` package: pip install datasets")
+        if not HAS_TV:
+            sys.exit("torchvision is required for transforms. "
+                     "Install it: pip install torchvision")
+
+        print(f"[ESH-Vision] Loading HuggingFace dataset: {args.hf_dataset}")
+        hf_kwargs = {"trust_remote_code": True}
+        if args.hf_token:
+            hf_kwargs["token"] = args.hf_token
+        if args.hf_cache_dir:
+            hf_kwargs["cache_dir"] = args.hf_cache_dir
+
+        raw_ds = hf_load_dataset(args.hf_dataset, **hf_kwargs)
+
+        # Pick the train split
+        split_name = args.hf_split
+        if split_name not in raw_ds:
+            available = list(raw_ds.keys())
+            print(f"[ESH-Vision] Split '{split_name}' not found. Available: {available}")
+            split_name = available[0]
+            print(f"[ESH-Vision] Using split: '{split_name}'")
+
+        transform = transforms.Compose([
+            transforms.RandomResizedCrop(args.img_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.TrivialAugmentWide(),
+            transforms.ToTensor(),
+        ])
+
+        train_ds = HFImageDataset(raw_ds[split_name], transform=transform)
+        num_classes = train_ds.num_classes
+        print(f"[ESH-Vision] Dataset loaded: {len(train_ds)} samples, "
+              f"{num_classes} classes")
     else:
+        # ---- Local ImageFolder dataset ----
         if not HAS_TV:
             sys.exit("torchvision is required for real datasets. "
                      "Install it or use --smoke_test.")
@@ -358,6 +441,14 @@ def parse_args() -> argparse.Namespace:
     # Data
     p.add_argument("--data_dir", type=str, default="./data/imagenet",
                     help="Path to ImageFolder-style dataset")
+    p.add_argument("--hf_dataset", type=str, default=None,
+                    help="HuggingFace dataset name (e.g. interneuron/imagenet-100)")
+    p.add_argument("--hf_split", type=str, default="train",
+                    help="HuggingFace dataset split to use")
+    p.add_argument("--hf_token", type=str, default=None,
+                    help="HuggingFace API token (for gated datasets)")
+    p.add_argument("--hf_cache_dir", type=str, default=None,
+                    help="Cache directory for HuggingFace downloads")
     p.add_argument("--img_size", type=int, default=224)
     p.add_argument("--num_classes", type=int, default=1000)
     p.add_argument("--num_workers", type=int, default=4)
