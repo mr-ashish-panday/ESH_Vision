@@ -322,14 +322,20 @@ def train(args: argparse.Namespace):
         # Save checkpoint
         if (epoch + 1) % args.save_every == 0 or (epoch + 1) == args.epochs:
             ckpt_path = Path(args.output_dir) / f"esh_vision_ep{epoch+1}.pt"
-            torch.save({
-                "epoch": epoch + 1,
-                "global_step": global_step,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "config": config,
-            }, ckpt_path)
-            print(f"  → Checkpoint saved: {ckpt_path}")
+            try:
+                torch.save({
+                    "epoch": epoch + 1,
+                    "global_step": global_step,
+                    "model_state_dict": model.state_dict(),
+                    "config": config,
+                }, ckpt_path)
+                print(f"  → Checkpoint saved: {ckpt_path}")
+            except RuntimeError as e:
+                print(f"  ⚠ Checkpoint save failed (disk full?): {e}")
+                # Try to remove partial file
+                if ckpt_path.exists():
+                    ckpt_path.unlink()
+                print("  ⚠ Training continues — checkpoint skipped")
 
     # Save training log
     log_path = Path(args.output_dir) / "train_log.json"
