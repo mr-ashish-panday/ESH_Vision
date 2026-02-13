@@ -179,33 +179,6 @@ class SpatialSoftEntropyRouter(nn.Module):
 # 3. Bidirectional Vision State Space Model (VSSM)
 # ---------------------------------------------------------------------------
 
-
-@torch.jit.script
-def _ssm_recurrence(
-    x: torch.Tensor,       # (B, L, E)
-    A_bar: torch.Tensor,   # (B, L, E, N)
-    dt_B: torch.Tensor,    # (B, L, E, N)
-    C_param: torch.Tensor, # (B, L, N)
-    reverse: bool,
-) -> torch.Tensor:
-    """JIT-compiled SSM recurrence — eliminates Python-loop overhead."""
-    B_sz, L, E = x.shape
-
-    h = torch.zeros(B_sz, E, C_param.shape[2], device=x.device, dtype=x.dtype)
-    ys = torch.empty(B_sz, L, E, device=x.device, dtype=x.dtype)
-
-    if reverse:
-        for i in range(L - 1, -1, -1):
-            h = A_bar[:, i] * h + dt_B[:, i] * x[:, i].unsqueeze(-1)
-            ys[:, i] = (h * C_param[:, i].unsqueeze(1)).sum(-1)
-    else:
-        for i in range(L):
-            h = A_bar[:, i] * h + dt_B[:, i] * x[:, i].unsqueeze(-1)
-            ys[:, i] = (h * C_param[:, i].unsqueeze(1)).sum(-1)
-
-    return ys
-
-
 class BidirectionalVSSM(nn.Module):
     """Pure-PyTorch bidirectional S4/Mamba-style selective scan for 2D.
 
@@ -302,8 +275,23 @@ class BidirectionalVSSM(nn.Module):
         # B discretised: B_bar = dt * B
         dt_B = torch.einsum("ble,bln->blen", dt, B_param)  # (B, L, E, N)
 
-        # JIT-compiled recurrence (eliminates Python-loop overhead)
-        y = _ssm_recurrence(x, A_bar, dt_B, C_param, reverse)
+        # Iterate (sequential recurrence — checkpoint-safe)
+        indices = range(L - 1, -1, -1) if reverse else range(L)
+
+        h = torch.zeros(B, E, N, device=x.device, dtype=x.dtype)  # (B, E, N)
+        ys = []
+
+        for i in indices:
+            # h = A_bar * h + B_bar * x
+            h = A_bar[:, i] * h + dt_B[:, i] * x[:, i].unsqueeze(-1)  # (B, E, N)
+            # y = C * h
+            y_i = torch.einsum("ben,bn->be", h, C_param[:, i])  # (B, E)
+            ys.append(y_i)
+
+        if reverse:
+            ys = ys[::-1]
+
+        y = torch.stack(ys, dim=1)  # (B, L, E)
         return y
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
