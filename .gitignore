@@ -23,7 +23,9 @@ env/
 # Training artifacts
 checkpoints/
 saliency_maps/
+paper_assets/
 train_log.json
+train.log
 *.pt
 *.pth
 

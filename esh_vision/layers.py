@@ -180,11 +180,17 @@ class SpatialSoftEntropyRouter(nn.Module):
 # ---------------------------------------------------------------------------
 
 class BidirectionalVSSM(nn.Module):
-    """Pure-PyTorch bidirectional S4/Mamba-style selective scan for 2D.
+    """Pure-PyTorch quad-directional S4/Mamba-style selective scan for 2D.
 
-    Operates on the flattened patch sequence in *both* forward and reverse
-    directions, merging results via a learned gate. This avoids the need
-    for `mamba_ssm` CUDA kernels and is fully portable.
+    Scans the flattened patch sequence in 4 directions to capture full 2D
+    spatial context:
+      1. Row-major forward   (top-left → bottom-right)
+      2. Row-major reverse   (bottom-right → top-left)
+      3. Column-major forward (top-left → bottom-right, column-first)
+      4. Column-major reverse (bottom-right → top-left, column-first)
+
+    All 4 directions share SSM parameters — diversity comes from scan
+    ordering alone, so there is zero parameter increase over 2-way.
 
     Parameters
     ----------
@@ -210,7 +216,7 @@ class BidirectionalVSSM(nn.Module):
         # Input projection: project to inner dim
         self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
 
-        # SSM parameters (per-direction)
+        # SSM parameters (shared across all 4 scan directions)
         # A is initialised as the HiPPO-LegS matrix diagonal (log-space)
         self.A_log = nn.Parameter(
             torch.log(torch.arange(1, d_state + 1, dtype=torch.float32))
@@ -304,16 +310,29 @@ class BidirectionalVSSM(nn.Module):
         -------
         out : (B, N_patches, D) – processed embeddings.
         """
+        B, L, D = x.shape
+        H = W = int(math.sqrt(L))
         residual = x
 
         # Input projection → x_inner, z (gating)
         xz = self.in_proj(x)  # (B, L, 2*E)
         x_inner, z = xz.chunk(2, dim=-1)  # each (B, L, E)
 
-        # Bidirectional scan
-        y_fwd = self._ssm_scan(x_inner, reverse=False)
-        y_rev = self._ssm_scan(x_inner, reverse=True)
-        y = y_fwd + y_rev  # (B, L, E)
+        # --- Row-major scans (original bidirectional) -----------------------
+        y_row_fwd = self._ssm_scan(x_inner, reverse=False)
+        y_row_rev = self._ssm_scan(x_inner, reverse=True)
+
+        # --- Column-major scans (transpose H↔W, scan, transpose back) ------
+        E = x_inner.shape[-1]
+        x_col = x_inner.view(B, H, W, E).transpose(1, 2).contiguous().view(B, L, E)
+        y_col_fwd_t = self._ssm_scan(x_col, reverse=False)
+        y_col_rev_t = self._ssm_scan(x_col, reverse=True)
+        # Transpose back to row-major order
+        y_col_fwd = y_col_fwd_t.view(B, W, H, E).transpose(1, 2).contiguous().view(B, L, E)
+        y_col_rev = y_col_rev_t.view(B, W, H, E).transpose(1, 2).contiguous().view(B, L, E)
+
+        # Merge all 4 directions (average)
+        y = (y_row_fwd + y_row_rev + y_col_fwd + y_col_rev) * 0.25
 
         # Gated residual + D skip
         y = y * F.silu(z) + x_inner * self.D  # (B, L, E)
