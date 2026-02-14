@@ -1,17 +1,23 @@
 
+import argparse
 import time
 import torch
 import torch.cuda
 from esh_vision.model import ESHVisionBackbone, ESHVisionConfig
 
 def benchmark():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--amp", action="store_true", default=True)
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
+        torch.backends.cudnn.benchmark = True
         
-    # Config matching the training run
     cfg = ESHVisionConfig(
         embed_dim=256,
         depths=[3, 6, 6],
@@ -22,18 +28,19 @@ def benchmark():
     model = ESHVisionBackbone(cfg).to(device)
     model.train()
     
-    # Dummy batch matching training command (Batch 48)
-    B = 48
+    B = args.batch_size
+    print(f"\nBenchmarking Model (Batch={B}, AMP={args.amp})...")
+    
     x = torch.randn(B, 3, 224, 224, device=device)
     target = torch.randint(0, 100, (B,), device=device)
+    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
     
-    print(f"\nBenchmarking Model (Batch={B})...")
     print("Warmup...")
     for _ in range(5):
-        out = model(x)
-        features = out["features"]
-        loss = features.sum()
-        loss.backward()
+        with torch.cuda.amp.autocast(enabled=args.amp):
+            out = model(x)
+            loss = out["features"].sum()
+        scaler.scale(loss).backward()
         model.zero_grad()
         
     torch.cuda.synchronize()
@@ -42,10 +49,10 @@ def benchmark():
     
     print(f"Running {steps} steps...")
     for i in range(steps):
-        out = model(x)
-        features = out["features"]
-        loss = features.sum()
-        loss.backward()
+        with torch.cuda.amp.autocast(enabled=args.amp):
+            out = model(x)
+            loss = out["features"].sum()
+        scaler.scale(loss).backward()
         model.zero_grad()
         
     torch.cuda.synchronize()
