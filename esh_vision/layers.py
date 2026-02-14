@@ -179,62 +179,6 @@ class SpatialSoftEntropyRouter(nn.Module):
 # 3. Bidirectional Vision State Space Model (VSSM)
 # ---------------------------------------------------------------------------
 
-@torch.jit.script
-def _ssm_recurrence_efficient(
-    x: torch.Tensor,       # (B, L, E)
-    dt: torch.Tensor,      # (B, L, E)
-    A_log: torch.Tensor,   # (E, N)
-    B_param: torch.Tensor, # (B, L, N)
-    C_param: torch.Tensor, # (B, L, N)
-    reverse: bool,
-) -> torch.Tensor:
-    """JIT-compiled SSM recurrence with O(1) memory for A_bar."""
-    B, L, E = x.shape
-    N = A_log.shape[1]
-    
-    # A = -exp(A_log)
-    neg_exp_A = -torch.exp(A_log) # (E, N)
-
-    h = torch.zeros(B, E, N, device=x.device, dtype=x.dtype)
-    ys = torch.zeros(B, L, E, device=x.device, dtype=x.dtype)
-    
-    # Range
-    if reverse:
-        steps = range(L - 1, -1, -1)
-    else:
-        steps = range(L)
-        
-    for i in steps:
-        # 1. Compute dt[i] -> (B, E)
-        dt_i = dt[:, i]
-        
-        # 2. Compute A_bar[i] = exp(dt[i] * A)
-        # dt_i.unsqueeze(-1) is (B, E, 1)
-        # neg_exp_A is (E, N)
-        # Broadcast -> (B, E, N)
-        dt_A = dt_i.unsqueeze(-1) * neg_exp_A
-        A_bar = torch.exp(dt_A)
-        
-        # 3. Compute B_bar[i] = dt[i] * B_param[i]
-        # dt_i.unsqueeze(-1) is (B, E, 1)
-        # B_param[:, i].unsqueeze(1) is (B, 1, N)
-        # Broadcast -> (B, E, N)
-        B_bar = dt_i.unsqueeze(-1) * B_param[:, i].unsqueeze(1)
-        
-        # 4. Update h
-        x_i = x[:, i].unsqueeze(-1) # (B, E, 1)
-        h = A_bar * h + B_bar * x_i # (B, E, N)
-        
-        # 5. Output y[i] = (h * C[i]).sum(-1)
-        # h is (B, E, N)
-        # C_param[:, i].unsqueeze(1) is (B, 1, N)
-        # sum(-1) -> (B, E)
-        y_i = (h * C_param[:, i].unsqueeze(1)).sum(-1)
-        ys[:, i] = y_i
-
-    return ys
-
-
 class BidirectionalVSSM(nn.Module):
     """Pure-PyTorch quad-directional S4/Mamba-style selective scan for 2D.
 
@@ -328,10 +272,32 @@ class BidirectionalVSSM(nn.Module):
         # Δt: project and apply softplus
         dt = F.softplus(self.dt_proj(dt))  # (B, L, E)
 
-        # Run recurrence (JIT-compiled, memory efficient)
-        y = _ssm_recurrence_efficient(
-            x, dt, self.A_log, B_param, C_param, reverse=reverse
-        )
+        # A (discretised): A_bar = exp(A * dt)
+        A = -torch.exp(self.A_log)  # (E, N)
+        # Broadcasting: dt is (B, L, E), A is (E, N) → dt_A is (B, L, E, N)
+        dt_A = torch.einsum("ble,en->blen", dt, A)
+        A_bar = torch.exp(dt_A)  # (B, L, E, N)
+
+        # B discretised: B_bar = dt * B
+        dt_B = torch.einsum("ble,bln->blen", dt, B_param)  # (B, L, E, N)
+
+        # Iterate (sequential recurrence — checkpoint-safe)
+        indices = range(L - 1, -1, -1) if reverse else range(L)
+
+        h = torch.zeros(B, E, N, device=x.device, dtype=x.dtype)  # (B, E, N)
+        ys = []
+
+        for i in indices:
+            # h = A_bar * h + B_bar * x
+            h = A_bar[:, i] * h + dt_B[:, i] * x[:, i].unsqueeze(-1)  # (B, E, N)
+            # y = C * h
+            y_i = torch.einsum("ben,bn->be", h, C_param[:, i])  # (B, E)
+            ys.append(y_i)
+
+        if reverse:
+            ys = ys[::-1]
+
+        y = torch.stack(ys, dim=1)  # (B, L, E)
         return y
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -352,16 +318,21 @@ class BidirectionalVSSM(nn.Module):
         xz = self.in_proj(x)  # (B, L, 2*E)
         x_inner, z = xz.chunk(2, dim=-1)  # each (B, L, E)
 
-        # --- Row-major scans (original bidirectional) -----------------------
-        y_row_fwd = self._ssm_scan(x_inner, reverse=False)
-        y_row_rev = self._ssm_scan(x_inner, reverse=True)
-
-        # --- Column-major scans (transpose H↔W, scan, transpose back) ------
+        # Prepare column-major input (transpose H↔W)
         E = x_inner.shape[-1]
         x_col = x_inner.view(B, H, W, E).transpose(1, 2).contiguous().view(B, L, E)
-        y_col_fwd_t = self._ssm_scan(x_col, reverse=False)
-        y_col_rev_t = self._ssm_scan(x_col, reverse=True)
-        # Transpose back to row-major order
+
+        # --- Batch forward scans (row + col) into ONE call ------------------
+        x_fwd = torch.cat([x_inner, x_col], dim=0)  # (2B, L, E)
+        y_fwd = self._ssm_scan(x_fwd, reverse=False)
+        y_row_fwd, y_col_fwd_t = y_fwd.chunk(2, dim=0)
+
+        # --- Batch reverse scans (row + col) into ONE call ------------------
+        x_rev = torch.cat([x_inner, x_col], dim=0)  # (2B, L, E)
+        y_rev = self._ssm_scan(x_rev, reverse=True)
+        y_row_rev, y_col_rev_t = y_rev.chunk(2, dim=0)
+
+        # Transpose column-major outputs back to row-major order
         y_col_fwd = y_col_fwd_t.view(B, W, H, E).transpose(1, 2).contiguous().view(B, L, E)
         y_col_rev = y_col_rev_t.view(B, W, H, E).transpose(1, 2).contiguous().view(B, L, E)
 

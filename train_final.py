@@ -13,8 +13,8 @@ NeurIPS-standard training pipeline with:
   • Resume from checkpoint
   • CSV logging for post-hoc training curves
 
-Default config: Medium (embed_dim=256, depths=3,6,6) ≈ 150M params
-Fits RTX 3080 Ti 12GB in ~66 hours for 15 epochs on ImageNet-100.
+Default config: Small (embed_dim=128, depths=2,3,3) ≈ 30M params
+Fits RTX 3080 Ti 12GB in ~30 hours for 15 epochs on ImageNet-100.
 
 Usage
 -----
@@ -574,11 +574,11 @@ def parse_args():
     g.add_argument("--img_size", type=int, default=224)
     g.add_argument("--patch_size", type=int, default=16)
 
-    # Model architecture (Medium defaults for 70-hour budget)
+    # Model architecture (Small defaults for 30-hour budget)
     g = p.add_argument_group("Model")
-    g.add_argument("--embed_dim", type=int, default=256)
-    g.add_argument("--depths", type=str, default="3,6,6")
-    g.add_argument("--num_heads", type=str, default="4,8,8")
+    g.add_argument("--embed_dim", type=int, default=128)
+    g.add_argument("--depths", type=str, default="2,3,3")
+    g.add_argument("--num_heads", type=str, default="2,4,4")
     g.add_argument("--ssm_d_state", type=int, default=16)
     g.add_argument("--act_threshold", type=float, default=0.7)
     g.add_argument("--max_ponder", type=int, default=2)
@@ -589,8 +589,8 @@ def parse_args():
     g.add_argument("--epochs", type=int, default=15)
     g.add_argument("--warmup_epochs", type=int, default=2,
                     help="Linear warmup epochs")
-    g.add_argument("--batch_size", type=int, default=16)
-    g.add_argument("--grad_accum_steps", type=int, default=8)
+    g.add_argument("--batch_size", type=int, default=48)
+    g.add_argument("--grad_accum_steps", type=int, default=2)
     g.add_argument("--lr", type=float, default=5e-4)
     g.add_argument("--weight_decay", type=float, default=0.05)
     g.add_argument("--max_grad_norm", type=float, default=1.0)
@@ -616,7 +616,7 @@ def parse_args():
     g.add_argument("--no_amp", action="store_true")
     g.add_argument("--use_8bit", action="store_true", default=True)
     g.add_argument("--use_checkpoint", action="store_true", default=True)
-    g.add_argument("--num_workers", type=int, default=4)
+    g.add_argument("--num_workers", type=int, default=6)
 
     # Logging & checkpointing
     g = p.add_argument_group("Logging")
