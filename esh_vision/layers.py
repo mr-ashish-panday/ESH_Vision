@@ -179,6 +179,62 @@ class SpatialSoftEntropyRouter(nn.Module):
 # 3. Bidirectional Vision State Space Model (VSSM)
 # ---------------------------------------------------------------------------
 
+@torch.jit.script
+def _ssm_recurrence_efficient(
+    x: torch.Tensor,       # (B, L, E)
+    dt: torch.Tensor,      # (B, L, E)
+    A_log: torch.Tensor,   # (E, N)
+    B_param: torch.Tensor, # (B, L, N)
+    C_param: torch.Tensor, # (B, L, N)
+    reverse: bool,
+) -> torch.Tensor:
+    """JIT-compiled SSM recurrence with O(1) memory for A_bar."""
+    B, L, E = x.shape
+    N = A_log.shape[1]
+    
+    # A = -exp(A_log)
+    neg_exp_A = -torch.exp(A_log) # (E, N)
+
+    h = torch.zeros(B, E, N, device=x.device, dtype=x.dtype)
+    ys = torch.zeros(B, L, E, device=x.device, dtype=x.dtype)
+    
+    # Range
+    if reverse:
+        steps = range(L - 1, -1, -1)
+    else:
+        steps = range(L)
+        
+    for i in steps:
+        # 1. Compute dt[i] -> (B, E)
+        dt_i = dt[:, i]
+        
+        # 2. Compute A_bar[i] = exp(dt[i] * A)
+        # dt_i.unsqueeze(-1) is (B, E, 1)
+        # neg_exp_A is (E, N)
+        # Broadcast -> (B, E, N)
+        dt_A = dt_i.unsqueeze(-1) * neg_exp_A
+        A_bar = torch.exp(dt_A)
+        
+        # 3. Compute B_bar[i] = dt[i] * B_param[i]
+        # dt_i.unsqueeze(-1) is (B, E, 1)
+        # B_param[:, i].unsqueeze(1) is (B, 1, N)
+        # Broadcast -> (B, E, N)
+        B_bar = dt_i.unsqueeze(-1) * B_param[:, i].unsqueeze(1)
+        
+        # 4. Update h
+        x_i = x[:, i].unsqueeze(-1) # (B, E, 1)
+        h = A_bar * h + B_bar * x_i # (B, E, N)
+        
+        # 5. Output y[i] = (h * C[i]).sum(-1)
+        # h is (B, E, N)
+        # C_param[:, i].unsqueeze(1) is (B, 1, N)
+        # sum(-1) -> (B, E)
+        y_i = (h * C_param[:, i].unsqueeze(1)).sum(-1)
+        ys[:, i] = y_i
+
+    return ys
+
+
 class BidirectionalVSSM(nn.Module):
     """Pure-PyTorch quad-directional S4/Mamba-style selective scan for 2D.
 
@@ -272,32 +328,10 @@ class BidirectionalVSSM(nn.Module):
         # Δt: project and apply softplus
         dt = F.softplus(self.dt_proj(dt))  # (B, L, E)
 
-        # A (discretised): A_bar = exp(A * dt)
-        A = -torch.exp(self.A_log)  # (E, N)
-        # Broadcasting: dt is (B, L, E), A is (E, N) → dt_A is (B, L, E, N)
-        dt_A = torch.einsum("ble,en->blen", dt, A)
-        A_bar = torch.exp(dt_A)  # (B, L, E, N)
-
-        # B discretised: B_bar = dt * B
-        dt_B = torch.einsum("ble,bln->blen", dt, B_param)  # (B, L, E, N)
-
-        # Iterate (sequential recurrence — checkpoint-safe)
-        indices = range(L - 1, -1, -1) if reverse else range(L)
-
-        h = torch.zeros(B, E, N, device=x.device, dtype=x.dtype)  # (B, E, N)
-        ys = []
-
-        for i in indices:
-            # h = A_bar * h + B_bar * x
-            h = A_bar[:, i] * h + dt_B[:, i] * x[:, i].unsqueeze(-1)  # (B, E, N)
-            # y = C * h
-            y_i = torch.einsum("ben,bn->be", h, C_param[:, i])  # (B, E)
-            ys.append(y_i)
-
-        if reverse:
-            ys = ys[::-1]
-
-        y = torch.stack(ys, dim=1)  # (B, L, E)
+        # Run recurrence (JIT-compiled, memory efficient)
+        y = _ssm_recurrence_efficient(
+            x, dt, self.A_log, B_param, C_param, reverse=reverse
+        )
         return y
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
