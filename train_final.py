@@ -446,6 +446,15 @@ def train(args: argparse.Namespace):
                 )
                 total_loss = total_loss / args.grad_accum_steps
 
+            # --- NaN guard --------------------------------------------------
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
+                print(f"[ESH-Vision] WARNING: NaN/Inf loss at step {global_step}, "
+                      f"skipping batch")
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()
+                global_step += 1
+                continue
+
             # --- Backward ---------------------------------------------------
             scaler.scale(total_loss).backward()
 
@@ -591,7 +600,7 @@ def parse_args():
                     help="Linear warmup epochs")
     g.add_argument("--batch_size", type=int, default=48)
     g.add_argument("--grad_accum_steps", type=int, default=2)
-    g.add_argument("--lr", type=float, default=5e-4)
+    g.add_argument("--lr", type=float, default=2e-4)
     g.add_argument("--weight_decay", type=float, default=0.05)
     g.add_argument("--max_grad_norm", type=float, default=1.0)
     g.add_argument("--seed", type=int, default=42)

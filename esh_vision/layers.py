@@ -276,6 +276,7 @@ class BidirectionalVSSM(nn.Module):
         A = -torch.exp(self.A_log)  # (E, N)
         # Broadcasting: dt is (B, L, E), A is (E, N) → dt_A is (B, L, E, N)
         dt_A = torch.einsum("ble,en->blen", dt, A)
+        dt_A = dt_A.clamp(min=-20.0, max=0.0)  # numerical stability
         A_bar = torch.exp(dt_A)  # (B, L, E, N)
 
         # B discretised: B_bar = dt * B
